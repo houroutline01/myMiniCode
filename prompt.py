@@ -136,11 +136,6 @@ def update_context(messages: list) -> dict:
     原则：context 只反映"现在是什么状态"，不存历史。
     调用时机：每轮工具调用完成后，由 agent_loop 调用。
 
-    参数 messages 目前未使用，为 s09（跨会话记忆）预留接口。
-    s09 中 extract_memories(messages) 会扫描对话历史提取新记忆写入磁盘，
-    届时此函数需要读取 messages 来感知"本轮新增了哪些记忆"。
-    接口提前定好，到时不用改调用方。
-
     当前字段：
       workspace — 工作目录路径（几乎不变）
       memories  — MEMORY.md 内容（s09 接入后会动态变化）
