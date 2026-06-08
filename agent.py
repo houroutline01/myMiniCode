@@ -1,29 +1,13 @@
 """
-agent.py — Agent Loop（对应课程 s01 + s02 + s03 的核心逻辑）
+agent.py — Agent Loop（s01-s04 + s10 的核心逻辑）
 
-职责：
-  - 维护 messages 列表（对话历史）
-  - 调用 LLM API，解析响应
-  - 识别工具调用，经权限检查后执行，将结果喂回模型
-  - 循环直到模型不再调用工具
+阶段二相对阶段一的变化：
+  s04: check_permission() 直接调用 → trigger_hooks("PreToolUse", ...) 事件触发
+       PostToolUse 和 Stop 事件点新增
+  s10: 硬编码 SYSTEM 字符串 → get_system_prompt(context) 动态组装
+       agent_loop 新增 context 参数，每轮工具执行后更新 context
 
-与课程的关键差异（API 格式）：
-  课程使用 Anthropic SDK，本项目使用 OpenAI 兼容格式（DeepSeek）。
-  两者消息格式对比：
-
-  Anthropic:
-    response.stop_reason == "tool_use"
-    response.content 是 content block 列表
-    block.type == "tool_use", block.id, block.name, block.input
-    工具结果格式: {"type": "tool_result", "tool_use_id": ..., "content": ...}
-    放进 user role 的 content 列表
-
-  OpenAI（本项目）:
-    response.choices[0].finish_reason == "tool_calls"
-    response.choices[0].message.tool_calls 是工具调用列表
-    tc.id, tc.function.name, tc.function.arguments（JSON 字符串）
-    工具结果格式: {"role": "tool", "tool_call_id": ..., "content": ...}
-    每个结果是独立的 message，直接 append 到 messages
+与课程的关键差异（OpenAI vs Anthropic 格式）：见阶段一注释，本文件不重复。
 """
 
 import json
@@ -32,12 +16,11 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 from tools import TOOL_HANDLERS, TOOL_DEFINITIONS
-from permissions import check_permission
+from hooks import trigger_hooks
+from prompt import get_system_prompt, update_context
 
-# ── 初始化 ────────────────────────────────────────────────────
 load_dotenv(override=True)
 
-# DeepSeek 兼容 OpenAI 格式，只需替换 base_url
 client = OpenAI(
     api_key=os.environ["DEEPSEEK_API_KEY"],
     base_url="https://api.deepseek.com",
@@ -45,93 +28,107 @@ client = OpenAI(
 
 MODEL = "deepseek-chat"
 
-# System prompt：告诉模型它是编码助手，要用工具解决问题
-SYSTEM = (
-    f"你是一个编码助手，工作目录为 {os.getcwd()}。"
-    "优先使用工具完成任务，不要只说不做。"
-    "所有破坏性操作都会经过权限系统，无需你自行判断是否安全。"
-)
-
 
 # ═══════════════════════════════════════════════════════════════
 #  核心：Agent Loop
 # ═══════════════════════════════════════════════════════════════
 
-def agent_loop(messages: list):
+def agent_loop(messages: list, context: dict):
     """
     驱动一轮用户请求的完整处理流程。
 
-    参数 messages：调用方传入完整对话历史（含本轮 user message）。
-    函数直接修改 messages（append），调用方读取最后几条即可获取结果。
+    参数：
+      messages — 完整对话历史（含本轮 user message），函数直接修改此列表
+      context  — 当前运行状态（工作目录、记忆等），用于组装 system prompt
 
-    循环逻辑（s01 的核心模式）：
-      1. 调用 LLM，拿到 response
-      2. 把 assistant 消息追加到 messages
-      3. 如果没有工具调用（finish_reason != "tool_calls"），退出循环
-      4. 遍历所有工具调用，权限检查后执行，每个结果单独 append 到 messages
-      5. 回到步骤 1，把工具结果喂给模型继续处理
+    循环逻辑：
+      1. 从 context 组装 system prompt（带缓存，context 不变时直接复用）
+      2. 调用 LLM
+      3. 把 assistant 消息追加到 messages
+      4. finish_reason != "tool_calls" → 触发 Stop hook → 退出或继续
+      5. 遍历工具调用：PreToolUse hook → 执行 → PostToolUse hook → 结果入 messages
+      6. 更新 context，回到步骤 1
     """
     while True:
-        # ── 调用 LLM ──────────────────────────────────────────
+        # ── s10: 动态组装 system prompt ───────────────────────
+        # 每轮循环重新获取，context 变化时会重新组装，否则命中缓存
+        system = get_system_prompt(context)
+
         response = client.chat.completions.create(
             model=MODEL,
-            messages=messages,
+            messages=[{"role": "system", "content": system}] + messages,
             tools=TOOL_DEFINITIONS,
-            tool_choice="auto",   # 让模型自己决定是否调用工具
+            tool_choice="auto",
             max_tokens=8000,
         )
 
         choice = response.choices[0]
         assistant_message = choice.message
-
-        # 将 assistant 回复加入历史
-        # OpenAI SDK 的 message 对象可以直接 append，后续请求时 SDK 会自动序列化
         messages.append(assistant_message)
 
-        # ── 判断是否需要调用工具 ──────────────────────────────
-        # finish_reason == "tool_calls"：模型想调用工具，继续循环
-        # finish_reason == "stop"：模型认为任务完成，退出循环
+        # ── 判断是否继续循环 ───────────────────────────────────
         if choice.finish_reason != "tool_calls":
+            # s04: Stop hook
+            # 返回 None → 正常退出
+            # 返回字符串 → 注入为 user 消息，强制继续循环（s05 Nag 机制会用到）
+            force = trigger_hooks("Stop", messages)
+            if force:
+                messages.append({"role": "user", "content": force})
+                continue
             return
 
-        # ── 遍历工具调用（模型可能一次调用多个工具）────────────
+        # ── 遍历工具调用 ────────────────────────────────────────
         for tc in assistant_message.tool_calls:
             tool_name = tc.function.name
-            # arguments 是 JSON 字符串，需要解析为 dict
-            # 临时加在 agent.py 第 101 行之前
-            print(f"[DEBUG] raw arguments: {tc.function.arguments[:300]}")
-            args = json.loads(tc.function.arguments)
 
-            print(f"\n\033[36m▶ {tool_name}\033[0m", end="  ")
-            # 打印参数摘要（截断避免刷屏）
-            args_preview = json.dumps(args, ensure_ascii=False)[:100]
-            print(f"\033[90m{args_preview}\033[0m")
+            try:
+                args = json.loads(tc.function.arguments)
+            except json.JSONDecodeError as e:
+                # DeepSeek 偶发：长内容时 arguments JSON 被截断
+                print(f"\n\033[31m✗ {tool_name} 参数解析失败（JSON 截断）：{e}\033[0m")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": f"Error: 工具参数解析失败，请缩短内容后重试。({e})",
+                })
+                continue
 
-            # ── 权限检查（s03）────────────────────────────────
-            # check_permission 内部走三关流水线，返回 bool
-            if not check_permission(tool_name, args):
-                result = "Permission denied."
+            print(f"\n\033[36m▶ {tool_name}\033[0m  "
+                  f"\033[90m{json.dumps(args, ensure_ascii=False)[:100]}\033[0m")
+
+            # ── s04: PreToolUse hook（含权限检查）─────────────
+            # trigger_hooks 返回非 None = 被拦截，字符串即拦截原因
+            blocked = trigger_hooks("PreToolUse", tool_name, args)
+            if blocked:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": str(blocked),
+                })
+                continue
+
+            # ── 工具执行 ────────────────────────────────────────
+            handler = TOOL_HANDLERS.get(tool_name)
+            if handler is None:
+                result = f"Error: 未知工具 {tool_name}"
             else:
-                # ── 工具执行（s02）────────────────────────────
-                handler = TOOL_HANDLERS.get(tool_name)
-                if handler is None:
-                    result = f"Error: 未知工具 {tool_name}"
-                else:
-                    try:
-                        result = handler(**args)
-                    except Exception as e:
-                        result = f"Error: {e}"
+                try:
+                    result = handler(**args)
+                except Exception as e:
+                    result = f"Error: {e}"
 
-            # 打印结果摘要（前 200 字符）
             print(f"\033[90m{str(result)[:200]}\033[0m")
 
-            # ── 将工具结果追加到 messages ─────────────────────
-            # OpenAI 格式：每个工具结果是独立的 {"role": "tool", ...} 消息
-            # tool_call_id 必须与请求中的 tc.id 对应，模型靠此匹配结果
+            # ── s04: PostToolUse hook ──────────────────────────
+            # 返回值被忽略，纯副作用（日志、统计、警告等）
+            trigger_hooks("PostToolUse", tool_name, args, str(result))
+
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
                 "content": str(result),
             })
 
-        # 所有工具执行完毕，带着结果进入下一轮循环，继续调用 LLM
+        # ── s10: 每轮工具执行后更新 context ────────────────────
+        # 此时文件系统可能已变化（write_file 等），重新派生状态
+        context = update_context(messages)
