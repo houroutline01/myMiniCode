@@ -1,7 +1,10 @@
 """
 main.py — 程序入口，REPL 交互循环
 
-阶段二相对阶段一的变化：
+阶段三相对阶段二的变化：
+  - 标题更新到阶段三（s01-s06 + s10）
+
+阶段二相对阶段一的变化（保留注释）：
   - 初始化 context，传给 agent_loop
   - 每轮对话后更新 context（接 s10 的 update_context）
   - 用户输入提交后触发 UserPromptSubmit hook（接 s04）
@@ -28,7 +31,7 @@ def print_response(messages: list):
 
 def main():
     print("=" * 50)
-    print("  编码助手（阶段二：s01-s04 + s10）")
+    print("  编码助手（阶段三：s01-s06 + s10）")
     print(f"  模型：{MODEL}")
     print("  输入问题后回车发送，输入 q 退出")
     print("=" * 50)

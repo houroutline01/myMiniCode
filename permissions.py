@@ -18,6 +18,7 @@ permissions.py — 三关权限系统（对应课程 s03 + 优化）
   - "prompt" → 经过 Gate1（仅 bash）→ Gate2 → Gate3
 """
 
+import json
 from tools import TOOL_RISK
 
 # ═══════════════════════════════════════════════════════════════
@@ -59,18 +60,15 @@ def _check_deny_list(command: str) -> str | None:
 PERMISSION_RULES = [
     {
         # bash 命令包含常见破坏性关键词时，提示用户确认
+        # 注：write_file / edit_file 规则在阶段三已删除，
+        #     原因：TOOL_RISK 改为 "safe"，safe_path() 是真正的文件边界保护。
+        #     合法文件写入不需要每次用户确认，过度询问只会制造噪音。
         "tools": ["bash"],
         "check": lambda args: any(
             kw in args.get("command", "")
             for kw in ["rm ", "rmdir", "> /etc/", "chmod 777", "chown", "curl", "wget", "pip install"]
         ),
         "message": "bash 命令包含潜在危险操作",
-    },
-    {
-        # write_file / edit_file 始终需要确认（写操作影响文件系统）
-        "tools": ["write_file", "edit_file"],
-        "check": lambda args: True,
-        "message": "文件写入/编辑操作",
     },
 ]
 
@@ -126,48 +124,70 @@ def _ask_user(tool_name: str, args: dict, reason: str) -> str:
 #  主入口：check_permission
 # ═══════════════════════════════════════════════════════════════
 
-def check_permission(tool_name: str, args: dict) -> bool:
+def check_permission(tool_name: str, args: dict, interactive: bool = True) -> bool:
     """
     三关权限检查总入口，返回 True 表示允许执行，False 表示拒绝。
 
-    调用方（agent_loop）只需关心返回值，不需要了解内部逻辑。
+    参数：
+      tool_name   — 工具名，用于查询风险级别和匹配规则
+      args        — 工具参数，用于规则检查（如 bash 命令内容）
+      interactive — 是否可以交互式询问用户（默认 True）
+                    主 agent 调用：True  → Gate3 弹出确认框
+                    子 agent 调用：False → Gate3 直接拒绝（不打断用户）
 
     流程：
       1. 查 TOOL_RISK：safe 级别直接返回 True，跳过所有检查
-      2. 查 session 白名单：在白名单内直接返回 True
-      3. Gate1（仅 bash）：黑名单命中直接返回 False
+      2. 查 session 白名单：在白名单内直接返回 True（主子 agent 共享）
+      3. Gate1（仅 bash）：黑名单命中直接返回 False（无论 interactive）
       4. Gate2：规则匹配，未命中直接返回 True
-      5. Gate3：命中规则时询问用户，根据答案更新白名单并返回结果
+      5. Gate3：
+           interactive=True  → 询问用户，根据答案更新白名单
+           interactive=False → 打印提示，直接返回 False
+
+    session 白名单继承机制：
+      _SESSION_ALLOWLIST 是模块级变量，进程内所有代码共享同一个集合。
+      主 agent 通过 Gate3 批准的工具，子 agent 自动继承，无需额外处理。
     """
     risk = TOOL_RISK.get(tool_name, "prompt")
 
-    # ── 风险级别：safe，直接放行 ──────────────────────────────
+    # ── 风险级别：safe，直接放行（write_file/edit_file 在阶段三变为 safe）──
     if risk == "safe":
         return True
 
-    # ── session 白名单：用户已说过"始终允许" ─────────────────
+    # ── session 白名单：用户已说过"始终允许"（主子 agent 天然共享）──────
     if tool_name in _SESSION_ALLOWLIST:
         print(f"\033[90m[权限] {tool_name} 在会话白名单中，自动放行\033[0m")
         return True
 
-    # ── Gate 1：bash 黑名单硬拒绝 ─────────────────────────────
+    # ── Gate 1：bash 黑名单硬拒绝（无论 interactive，黑名单不讲情面）────
     if tool_name == "bash":
         blocked = _check_deny_list(args.get("command", ""))
         if blocked:
             print(f"\n\033[31m⛔ 黑名单拦截：命令包含 {blocked!r}\033[0m")
             return False
 
-    # ── Gate 2：规则匹配 ──────────────────────────────────────
+    # ── Gate 2：规则匹配 ──────────────────────────────────────────────
     reason = _check_rules(tool_name, args)
     if reason is None:
-        # 没有命中任何规则，直接放行（例如：bash 运行 echo、ls 等安全命令）
+        # 没有命中任何规则，直接放行（如 bash 运行 echo、ls 等安全命令）
         return True
 
-    # ── Gate 3：用户确认 ──────────────────────────────────────
+    # ── Gate 3：用户确认（interactive 参数在此分叉）─────────────────
+    if not interactive:
+        # 子 agent 模式：不能打断用户，命中规则直接拒绝
+        # 打印提示，方便用户事后了解为何子任务失败
+        print(
+            f"\n\033[33m[子 Agent 权限] 操作被拒绝（非交互模式）：{reason}\033[0m"
+            f"\n  工具：{tool_name}，参数：{json.dumps(args, ensure_ascii=False)[:80]}"
+            f"\n  提示：若需执行此操作，请在主 agent 中进行（会弹出确认框）\033[0m"
+        )
+        return False
+
+    # interactive=True：正常询问用户
     decision = _ask_user(tool_name, args, reason)
 
     if decision == "allow_always":
-        # 加入 session 白名单，本次会话后续不再询问
+        # 加入 session 白名单，本次会话后续不再询问（子 agent 也会继承）
         _SESSION_ALLOWLIST.add(tool_name)
         print(f"\033[90m[权限] {tool_name} 已加入会话白名单\033[0m")
         return True
