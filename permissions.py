@@ -18,7 +18,29 @@ permissions.py — 三关权限系统（对应课程 s03 + 优化）
   - "prompt" → 经过 Gate1（仅 bash）→ Gate2 → Gate3
 """
 
+import re
 from tools import TOOL_RISK
+
+# ── 辅助函数 ───────────────────────────────────────────────────
+
+def _bash_writes_file(command: str) -> bool:
+    """
+    判断 bash 命令是否通过非 write_file 途径写入文件。
+    目的：防止模型绕过权限系统，用 bash 悄悄写文件。
+
+    检测两类模式：
+      1. 输出重定向到文件：> filename 或 >> filename
+         排除无害的：>nul、>/dev/null、数字开头的错误重定向（2>）
+      2. Python 内联写文件：open(..., 'w') 或 open(..., "w")
+    """
+    # 匹配 > 或 >> 但排除 >nul、>/dev/null、2>、&> 等无害形式
+    if re.search(r'(?<![0-9&])\s*>{1,2}\s*(?!nul\b|/dev/null)', command):
+        return True
+    # 匹配 Python open() 写模式
+    if re.search(r'open\s*\(.*["\']w["\']', command):
+        return True
+    return False
+
 
 # ═══════════════════════════════════════════════════════════════
 #  Gate 1：bash 黑名单（硬拒绝，不询问用户）
@@ -65,6 +87,14 @@ PERMISSION_RULES = [
             for kw in ["rm ", "rmdir", "> /etc/", "chmod 777", "chown", "curl", "wget", "pip install"]
         ),
         "message": "bash 命令包含潜在危险操作",
+    },
+    {
+        # bash 通过重定向写文件，效果等同于 write_file，同样需要确认
+        # 检测 "> 非空设备" 的模式，排除 >nul / >/dev/null / 2> 等无害重定向
+        # 典型绕过方式：echo content > file.py、python -c "open(...).write(...)"
+        "tools": ["bash"],
+        "check": lambda args: _bash_writes_file(args.get("command", "")),
+        "message": "bash 命令包含文件写入操作（重定向或 open() 写入）",
     },
     {
         # write_file / edit_file 始终需要确认（写操作影响文件系统）
