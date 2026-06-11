@@ -178,6 +178,7 @@ TOOL_RISK = {
     "todo_write": "safe",    # 内存状态操作，无文件系统风险
     "todo_config": "safe",   # 开关操作，无安全风险
     "task":       "safe",    # 子 agent 内部有独立权限检查
+    "compact":    "safe",    # context 管理，在 agent_loop 里特殊处理（绕过 TOOL_HANDLERS）
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -321,6 +322,28 @@ TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["enabled"],
+            },
+        },
+    },
+    # ── 阶段四新增：compact ───────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "compact",
+            "description": (
+                "将早期对话历史压缩为摘要，释放 context 空间。\n"
+                "当对话很长、context 即将耗尽时调用。\n"
+                "压缩后保留当前目标和关键信息，旧的工具调用历史会被清除。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "focus": {
+                        "type": "string",
+                        "description": "压缩时需要特别保留的信息提示（可选）",
+                    },
+                },
+                "required": [],
             },
         },
     },

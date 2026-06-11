@@ -31,7 +31,7 @@ def print_response(messages: list):
 
 def main():
     print("=" * 50)
-    print("  编码助手（阶段三：s01-s06 + s10）")
+    print("  编码助手（阶段四：s01-s08 + s10 + s11）")
     print(f"  模型：{MODEL}")
     print("  输入问题后回车发送，输入 q 退出")
     print("=" * 50)
